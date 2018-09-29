@@ -1,0 +1,8 @@
+chat/TestScenarioWithInterceptorsOnServerSide.class
+chat/TestDiffusion.class
+chat/TestScenarioWithInterceptorsOnClientSide.class
+chat/TestScenarioOssatureDeDepart.class
+chat/TestMutexSimple.class
+chat/TestElectionWithoutInterceptor.class
+chat/TestDiffusionScenario2.class
+chat/VectorClockTest.class

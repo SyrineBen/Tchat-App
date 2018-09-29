@@ -1,0 +1,1039 @@
+/**
+This file is part of the CSC4509 teaching unit.
+
+Copyright (C) 2012-2018 Télécom SudParis
+
+This is free software: you can redistribute it and/or modify
+it under the terms of the GNU Lesser General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This software platform is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Lesser General Public License for more details.
+
+You should have received a copy of the GNU Lesser General Public License
+along with the CSC4509 teaching unit. If not, see <http://www.gnu.org/licenses/>.
+
+Initial developer(s): Denis Conan
+Contributor(s):
+ */
+package chat.server;
+
+import static chat.common.Log.COMM;
+import static chat.common.Log.GEN;
+import static chat.common.Log.LOGGER_NAME_CHAT;
+import static chat.common.Log.LOGGER_NAME_COMM;
+import static chat.common.Log.LOGGER_NAME_ELECTION;
+import static chat.common.Log.LOGGER_NAME_GEN;
+import static chat.common.Log.LOGGER_NAME_TEST;
+import static chat.common.Log.LOGGER_NAME_MUTEX;
+import static chat.common.Log.LOG_ON;
+import static chat.common.Log.ELECTION;
+import static chat.common.Log.MUTEX;
+
+import java.io.IOException;
+import java.io.Serializable;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.net.StandardSocketOptions;
+import java.nio.channels.ClosedChannelException;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.TreeMap;
+
+import org.apache.log4j.Level;
+
+import chat.common.FullDuplexMsgWorker;
+import chat.common.Log;
+import chat.common.RequestVector;
+import chat.server.algorithms.election.Action;
+import chat.server.algorithms.election.ElectionLeaderContent;
+import chat.server.algorithms.election.ElectionTokenContent;
+import chat.server.algorithms.mutex.MutexRequestContent;
+import chat.server.algorithms.mutex.MutexTokenContent;
+
+/**
+ * This class defines server object. The server object connects to existing chat
+ * servers, waits for connections from other chat servers and from chat clients,
+ * and forwards chat messages received from chat clients to other 'local' chat
+ * clients and to the other chat servers.
+ * 
+ * The chat servers can be organised into a network topology forming cycles
+ * since the method <tt>forward</tt> is only called when the message to forward
+ * has not already been received and forwarded.
+ * 
+ * This class is provided as the starting point to implement distributed
+ * algorithms. This explains why it is abstract.
+ * 
+ * @author Denis Conan
+ * 
+ */
+public class Server {
+	/**
+	 * the base of the port number for connecting to clients.
+	 */
+	private static final int BASE_PORTNB_LISTEN_CLIENT = 2050;
+	/**
+	 * the offset of the port number for connecting to servers.
+	 */
+	private static final int OFFSET_PORTNB_LISTEN_SERVER = 100;
+	/**
+	 * the number of clients that have opened a connection to this server till the
+	 * beginning of its execution. Each client is assigned an identity in the form
+	 * of an integer and this identity is provided by the server it is connected to:
+	 * it is the current value of this integer.
+	 */
+	private int numberOfClients = 0;
+	/**
+	 * the selector.
+	 */
+	private final Selector selector;
+	/**
+	 * the runnable object of the server that receives the messages from the chat
+	 * clients and the other chat servers.
+	 */
+	private final ReadMessagesFromNetwork runnableToRcvMsgs;
+	/**
+	 * the thread of the server that receives the messages from the chat clients and
+	 * the other chat servers.
+	 */
+	private final Thread threadToRcvMsgs;
+	/**
+	 * identity of this server.
+	 */
+	private final int identity;
+	// The following attributes are shared through getters and setters, and must be
+	// accessed into synchronized blocks. We apply the idiom Self Encapsulate Field,
+	// that is we use methods to manipulate these attributes, in order to make
+	// explicit their manipulation (into synchronized blocks).
+	/**
+	 * selection key of the connection from which the last message was received.
+	 * This data structure is shared and must be accessed into {@code synchronized}
+	 * blocks. <br>
+	 * Be careful: use methods to manipulate this attribute (idiom Self Encapsulate
+	 * Field).
+	 */
+	private SelectionKey selectionKeyOfCurrentMsg;
+	/**
+	 * selection keys of the server message workers. This data structure is shared
+	 * and must be accessed into {@code synchronized} blocks. <br>
+	 * Be careful: use methods to manipulate this attribute (idiom Self Encapsulate
+	 * Field).
+	 */
+	private final Map<SelectionKey, FullDuplexMsgWorker> allServerWorkers;
+	/**
+	 * selection keys of the client message workers. This data structure is shared
+	 * and must be accessed into {@code synchronized} blocks. <br>
+	 * Be careful: use methods to manipulate this attribute (idiom Self Encapsulate
+	 * Field).
+	 */
+	private final Map<SelectionKey, FullDuplexMsgWorker> allClientWorkers;
+	/**
+	 * one counter per client in order to control the propagation of client
+	 * messages: stop forward to remote servers when the message has already been
+	 * forwarded ; the counter is set by the server receiving the message from the
+	 * client. This data structure is shared and must be accessed into
+	 * {@code synchronized} blocks. <br>
+	 * Be careful: use methods to manipulate this attribute (idiom Self Encapsulate
+	 * Field).
+	 */
+	private final Map<Integer, Integer> clientSeqNumbers;
+	/**
+	 * selection keys of the server neighbors.
+	 */
+	private TreeMap<Integer, SelectionKey> sortedMapOfServerSelectionKeys;
+	/**
+	 * indicates if the server is in critical area.
+	 */
+	private Boolean critical;
+
+	
+	/**
+	 * the variables of election algorithm.
+	 */
+	private int caw, rec, lrec, parent, win; 
+	/**
+	 * the variables of mutex algorithm.
+	 */
+	private RequestVector vector; 
+	/**
+	 * clock.
+	 */
+	private int ns;
+	/**
+	 * jeton.
+	 */
+	private RequestVector jet;
+	
+	/**
+	 * State of the server.
+	 */
+
+	private State state;
+	/**
+	 * selection key of the parent.
+	 */
+	private SelectionKey electionParentKey;
+
+	
+	/**
+	 * récupererla clé d'election du parent.
+	 * @return electionParentKey
+	 *        clé du parent.
+	 */
+
+
+
+	public SelectionKey getElectionParentKey() {
+		return electionParentKey;
+	}
+
+	/**
+	 * modifier la clé d'election du parent.
+	 * @param electionParentKey
+	 *        clé du parent.
+	 */
+	public void setElectionParentKey(final SelectionKey electionParentKey) {
+		this.electionParentKey = electionParentKey;
+	}
+	/**
+	 * get a map contains selection keys of the server neighbors.
+	 * @return sorted map of selection keys.
+	 */
+
+	public TreeMap<Integer, SelectionKey> getSortedMapOfServerSelectionKeys() {
+		return sortedMapOfServerSelectionKeys;
+	}
+
+	{
+		caw = -1;
+		parent = -1;
+		win = -1;
+		rec = 0;
+		lrec = 0;
+		state = State.sleeping;
+		vector = new RequestVector();
+		critical = false;
+		ns = 0;
+		sortedMapOfServerSelectionKeys = new TreeMap<Integer, SelectionKey>();
+		
+	}
+
+	/**
+	 * return si serveur en zone critique ou nn.
+	 * @return critical
+	 *        critical egal true ou false.
+	 */
+	public Boolean getCritical() {
+		return critical;
+	}
+
+	/**
+	 * set variable critical.
+	 * @param critical
+	 *       true ou false.
+	 */
+	public void setCritical(final Boolean critical) {
+		this.critical = critical;
+	}
+
+	/**
+	 * initialises the collection attributes and the state of the server, and
+	 * creates the channels that are accepting connections from clients and servers.
+	 * At the end of the constructor, the server opens connections to the other
+	 * servers (hostname, identifier) that are provided in the command line
+	 * arguments.
+	 * 
+	 * NB: after the construction of a client object, the thread for reading
+	 * messages must be started using the method
+	 * {@link #startThreadReadMessagesFromNetwork}.
+	 * 
+	 * @param args
+	 *            java command arguments.
+	 */
+
+	public Server(final String[] args) {
+
+		Log.configureALogger(LOGGER_NAME_CHAT, Level.WARN);
+		Log.configureALogger(LOGGER_NAME_COMM, Level.WARN);
+		Log.configureALogger(LOGGER_NAME_ELECTION, Level.TRACE);
+		Log.configureALogger(LOGGER_NAME_GEN, Level.WARN);
+		Log.configureALogger(LOGGER_NAME_TEST, Level.WARN);
+		Log.configureALogger(LOGGER_NAME_MUTEX, Level.TRACE);
+
+		Objects.requireNonNull(args, "args cannot be null");
+		identity = Integer.parseInt(args[0]);
+		int portnum = BASE_PORTNB_LISTEN_CLIENT + Integer.parseInt(args[0]);
+		allServerWorkers = new HashMap<>();
+		allClientWorkers = new HashMap<>();
+		clientSeqNumbers = new HashMap<>();
+		sortedMapOfServerSelectionKeys = new TreeMap<>();
+		InetSocketAddress rcvAddressClient;
+		InetSocketAddress rcvAddressServer;
+		try {
+			selector = Selector.open();
+		} catch (IOException e) {
+			throw new IllegalStateException("cannot create the selector");
+		}
+		ServerSocketChannel listenChanClient = null;
+		ServerSocketChannel listenChanServer = null;
+		try {
+			listenChanClient = ServerSocketChannel.open();
+			listenChanClient.configureBlocking(false);
+		} catch (IOException e) {
+			throw new IllegalStateException("cannot set the blocking option to a server socket");
+		}
+		try {
+			listenChanServer = ServerSocketChannel.open();
+		} catch (IOException e) {
+			throw new IllegalStateException("cannot open the server socket" + " for accepting server connections");
+		}
+		try {
+			rcvAddressClient = new InetSocketAddress(portnum);
+			listenChanClient.setOption(StandardSocketOptions.SO_REUSEADDR, true);
+			rcvAddressServer = new InetSocketAddress(portnum + OFFSET_PORTNB_LISTEN_SERVER);
+			listenChanServer.setOption(StandardSocketOptions.SO_REUSEADDR, true);
+		} catch (IOException e) {
+			throw new IllegalStateException("cannot set the SO_REUSEADDR option");
+		}
+		try {
+			listenChanClient.bind(rcvAddressClient);
+			listenChanServer.bind(rcvAddressServer);
+		} catch (IOException e) {
+			throw new IllegalStateException("cannot bind to a server socket");
+		}
+		try {
+			listenChanClient.configureBlocking(false);
+			listenChanServer.configureBlocking(false);
+		} catch (IOException e) {
+			throw new IllegalStateException("cannot set the blocking option");
+		}
+		SelectionKey acceptClientKey = null;
+		SelectionKey acceptServerKey = null;
+		try {
+			acceptClientKey = listenChanClient.register(selector, SelectionKey.OP_ACCEPT);
+			acceptServerKey = listenChanServer.register(selector, SelectionKey.OP_ACCEPT);
+		} catch (ClosedChannelException e) {
+			throw new IllegalStateException("cannot register a server socket");
+		}
+		if (LOG_ON && COMM.isInfoEnabled()) {
+			COMM.info("  listenChanClient ok on port " + listenChanClient.socket().getLocalPort());
+			COMM.info("  listenChanServer ok on port " + listenChanServer.socket().getLocalPort());
+		}
+		runnableToRcvMsgs = new ReadMessagesFromNetwork(this, selector, acceptClientKey, listenChanClient,
+				acceptServerKey, listenChanServer);
+		threadToRcvMsgs = new Thread(runnableToRcvMsgs);
+		for (int i = 1; i < args.length; i = i + 2) {
+			try {
+				addServer(args[i],
+						(BASE_PORTNB_LISTEN_CLIENT + Integer.parseInt(args[i + 1]) + OFFSET_PORTNB_LISTEN_SERVER));
+			} catch (IOException e) {
+				COMM.error(e.getLocalizedMessage());
+				return;
+			}
+		}
+
+		assert invariant();
+	}
+
+	/**
+     * récuperer l'état du processus.
+     * @return state
+     *      l'état du processus
+     */
+	public State getState() {
+		return state;
+	}
+    /**
+     * modifier l'état du processus.
+     * @param state
+     *       l'état du processus.
+     */
+	public void setState(final State state) {
+		this.state = state;
+	}
+	
+	/**
+	 * set a map contains selection keys of the server neighbors.
+	 * @param id
+	 *      the server identity.
+	 * @param key
+	 *      selection key to add.
+	 *               
+	 */
+	public void putInSortedMapOfServerSelectionKeys(final int id, final SelectionKey key) {
+		this.sortedMapOfServerSelectionKeys.put(id, key);
+	}
+
+	/**
+	 * connects socket, creates MsgWorker, and registers selection key of the remote
+	 * server. This method is called when connecting to a remote server. Connection
+	 * data are provided as arguments to the main.
+	 * 
+	 * @param host
+	 *            remote host's name.
+	 * @param port
+	 *            remote port's number.
+	 * @throws IOException
+	 *             the exception thrown in case of communication problem.
+	 */
+	private void addServer(final String host, final int port) throws IOException {
+		Objects.requireNonNull(host, "argument host cannot be null");
+		Socket rwSock;
+		SocketChannel rwChan;
+		InetSocketAddress rcvAddress;
+		if (LOG_ON && COMM.isInfoEnabled()) {
+			COMM.info("Opening connection with server on host " + host + " on port " + port);
+		}
+		InetAddress destAddr = InetAddress.getByName(host);
+		rwChan = SocketChannel.open();
+		rwSock = rwChan.socket();
+		// obtain the IP address of the target host
+		rcvAddress = new InetSocketAddress(destAddr, port);
+		// connect sending socket to remote port
+		rwSock.connect(rcvAddress);
+		FullDuplexMsgWorker worker = new FullDuplexMsgWorker(rwChan);
+		worker.configureNonBlocking();
+		SelectionKey serverKey = rwChan.register(selector, SelectionKey.OP_READ);
+		synchronized (this) {
+			addServerWorker(serverKey, worker);
+			if (LOG_ON && COMM.isDebugEnabled()) {
+				COMM.debug("getAllServerWorkersSize() = " + getAllServerWorkersSize());
+			}
+		}
+	}
+
+	/**
+	 * gets the identity of the server.
+	 * 
+	 * @return the identity of the server.
+	 */
+	public int getIdentity() {
+		return identity;
+	}
+
+	/**
+	 * gets the key of the SelectionKey that receives the current message. This
+	 * method that manipulates a shared attribute must be accessed into
+	 * {@code synchronized} blocks.
+	 * 
+	 * @return the current selection key.
+	 */
+	protected Optional<SelectionKey> getSelectionKeyOfCurrentMsg() {
+		return Optional.ofNullable(selectionKeyOfCurrentMsg);
+	}
+
+	/**
+	 * sets the key of the SelectionKey that receives the current message. This
+	 * selection key can be {@code null}. This method that manipulates a shared
+	 * attribute must be accessed into {@code synchronized} blocks.
+	 * 
+	 * @param selectionKeyOfCurrentMsg
+	 *            the current key.
+	 */
+	public void setSelectionKeyOfCurrentMsg(final SelectionKey selectionKeyOfCurrentMsg) {
+		this.selectionKeyOfCurrentMsg = selectionKeyOfCurrentMsg;
+	}
+
+	/**
+	 * gets the client sequence number of the given client. The sequence number is
+	 * accessed by the thread that read messages from the network into
+	 * {@code synchronized} blocks.
+	 * 
+	 * @param clientId
+	 *            the identifier of the client.
+	 * @return the sequence number of the client.
+	 */
+	protected Optional<Integer> getClientSeqNumbers(final int clientId) {
+		return Optional.ofNullable(clientSeqNumbers.get(clientId));
+	}
+
+	/**
+	 * sets the client sequence number of the given client. The sequence number is
+	 * accessed by the thread that read messages from the network (class
+	 * {@link ReadMessagesFromNetwork}) into {@code synchronized} blocks.
+	 * 
+	 * @param clientId
+	 *            the identifier of the client.
+	 * @param sequenceNumber
+	 *            the new sequence number.
+	 */
+	protected void setClientSeqNumbers(final int clientId, final int sequenceNumber) {
+		clientSeqNumbers.put(clientId, sequenceNumber);
+	}
+
+	/**
+	 * add a worker that correspond to a given neighbouring server. This method that
+	 * manipulates the collection must be accessed into {@code synchronized} blocks.
+	 * 
+	 * @param key
+	 *            the SelectionKey of the server worker to add.
+	 * @param worker
+	 *            the worker.
+	 */
+	protected void addServerWorker(final SelectionKey key, final FullDuplexMsgWorker worker) {
+		allServerWorkers.put(key, worker);
+	}
+
+	/**
+	 * gets the size of the collection. This method that manipulates the collection
+	 * must be accessed into {@code synchronized} blocks.
+	 * 
+	 * @return the size of the collection.
+	 */
+	protected int getAllServerWorkersSize() {
+		return allServerWorkers.size();
+	}
+
+	/**
+	 * gets the worker to communicate with a given neighbouring servers. This method
+	 * that manipulates the collection must be accessed into {@code synchronized}
+	 * blocks.
+	 * 
+	 * @param key
+	 *            the selection key to get the worker.
+	 * @return the given server worker.
+	 */
+	protected Optional<FullDuplexMsgWorker> getServerWorker(final SelectionKey key) {
+		return Optional.ofNullable(allServerWorkers.get(key));
+	}
+
+	/**
+	 * remove a worker to a given neighbouring server. This method that manipulates
+	 * the collection must be accessed into {@code synchronized} blocks.
+	 * 
+	 * @param key
+	 *            the SelectionKey of the server worker to remove.
+	 */
+	protected void removeServerWorker(final SelectionKey key) {
+		allServerWorkers.remove(key);
+	}
+
+	/**
+	 * add a worker that correspond to a given local client. This method that
+	 * manipulates the collection must be accessed into {@code synchronized} blocks.
+	 * 
+	 * @param key
+	 *            the SelectionKey of the client worker to add.
+	 * @param worker
+	 *            the worker.
+	 */
+	protected void addClientWorker(final SelectionKey key, final FullDuplexMsgWorker worker) {
+		allClientWorkers.put(key, worker);
+	}
+
+	/**
+	 * gets the size of the collection. This method that manipulates the collection
+	 * must be accessed into {@code synchronized} blocks.
+	 * 
+	 * @return the size of the collection.
+	 */
+	protected int getAllClientWorkersSize() {
+		return allClientWorkers.size();
+	}
+
+	/**
+	 * gets the worker to communicate with an attached client. This method that
+	 * manipulates the collection must be accessed into {@code synchronized} blocks.
+	 * 
+	 * @param key
+	 *            the selection key to get the worker.
+	 * @return the given client worker.
+	 */
+	protected Optional<FullDuplexMsgWorker> getClientWorker(final SelectionKey key) {
+		return Optional.ofNullable(allClientWorkers.get(key));
+	}
+
+	/**
+	 * remove a worker to a local client. This method that manipulates the
+	 * collection must be accessed into {@code synchronized} blocks.
+	 * 
+	 * @param key
+	 *            the SelectionKey of the client worker to remove.
+	 */
+	protected void removeClientWorker(final SelectionKey key) {
+		allClientWorkers.remove(key);
+	}
+
+	/**
+	 * checks the invariant of the class. The method is synchronized since it
+	 * accesses shared attributes
+	 * 
+	 * @return a boolean stating whether the invariant is maintained.
+	 */
+	public synchronized boolean invariant() {
+		return numberOfClients >= 0 && runnableToRcvMsgs != null && threadToRcvMsgs != null && allServerWorkers != null
+				&& allClientWorkers != null && clientSeqNumbers != null;
+	}
+
+	/**
+	 * starts the thread that is responible for reading messages from the clients
+	 * and the other servers.
+	 */
+	public void startThreadReadMessagesFromNetwork() {
+		threadToRcvMsgs.start();
+	}
+
+	/**
+	 * treats an input line from the console.
+	 * 
+	 * @param line
+	 *            the content of the message
+	 * @throws IOException
+	 *        IOException.
+	 */
+	public void treatConsoleInput(final String line) throws IOException {
+		Objects.requireNonNull(line, "argument line cannot be null");
+		if (LOG_ON && GEN.isDebugEnabled()) {
+			GEN.debug("new command line on console");
+		}
+		if (line.equals("quit")) {
+			threadToRcvMsgs.interrupt();
+			Thread.currentThread().interrupt();
+			return;
+		}
+		if (line.equals("election")) {
+			ElectionTokenContent token = new ElectionTokenContent(this.getIdentity(), this.getIdentity());
+			this.state = State.initiator;
+			this.caw = this.getIdentity();
+			this.sendToAllServers(Action.TOKEN_MESSAGE.identifier(), identity, -1, token);
+			if (LOG_ON && COMM.isInfoEnabled()) {
+				COMM.info("server identity = " + identity);
+			}
+
+		}
+		if (line.equals("mutex")) {
+			if (!this.critical) {
+				this.ns += 1;
+				MutexRequestContent request = new MutexRequestContent(this.getIdentity(), this.ns);
+				this.sendToAllServers(chat.server.algorithms.mutex.Action.REQUEST_MESSAGE.identifier(), identity, -1, request);
+				if (LOG_ON && MUTEX.isInfoEnabled()) {
+					MUTEX.info("server identity = " + identity + "Sends token request");
+				}
+			}
+		}
+	}
+
+	/**
+	 * accepts connection (socket level), creates MsgWorker, and registers selection
+	 * key of the remote server. This method is called when accepting a connection
+	 * from a remote server. This method must be accessed into {@code synchronized}
+	 * blocks.
+	 * 
+	 * @param sc
+	 *            server socket channel.
+	 * @throws IOException
+	 *             the exception thrown in case of communication problem.
+	 */
+	public void acceptNewServer(final ServerSocketChannel sc) throws IOException {
+		SocketChannel rwChan;
+		SelectionKey newKey;
+		rwChan = sc.accept();
+		if (rwChan != null) {
+			try {
+				FullDuplexMsgWorker worker = new FullDuplexMsgWorker(rwChan);
+				worker.configureNonBlocking();
+				newKey = rwChan.register(selector, SelectionKey.OP_READ);
+				synchronized (this) {
+					addServerWorker(newKey, worker);
+					if (LOG_ON && COMM.isDebugEnabled()) {
+						COMM.debug("getAllServerWorkersSize() = " + getAllServerWorkersSize());
+					}
+				}
+			} catch (ClosedChannelException e) {
+				COMM.error(e.getLocalizedMessage());
+			}
+		}
+	}
+
+	/**
+	 * the offset to compute the identity of the new client has a function of the
+	 * identity of the server and the number of connected clients.
+	 */
+	public static final int OFFSET_ID_CLIENT = 100;
+
+	/**
+	 * accepts connection (socket level), creates MsgWorker, and registers selection
+	 * key of the local client. This method is called when accepting a connection
+	 * from a local client.
+	 * 
+	 * @param sc
+	 *            server socket channel.
+	 * @throws IOException
+	 *             the exception thrown in case of communication problem.
+	 */
+	public void acceptNewClient(final ServerSocketChannel sc) throws IOException {
+		SocketChannel rwChan;
+		SelectionKey newKey;
+		rwChan = sc.accept();
+		if (rwChan != null) {
+			try {
+				FullDuplexMsgWorker worker = new FullDuplexMsgWorker(rwChan);
+				worker.configureNonBlocking();
+				newKey = rwChan.register(selector, SelectionKey.OP_READ);
+				synchronized (this) {
+					this.addClientWorker(newKey, worker);
+					worker.sendMsg(0, identity, -1, Integer.valueOf(identity * OFFSET_ID_CLIENT + numberOfClients));
+					numberOfClients++;
+					if (LOG_ON && COMM.isDebugEnabled()) {
+						COMM.debug("getAllClientWorkersSize() = " + getAllClientWorkersSize());
+					}
+				}
+			} catch (ClosedChannelException e) {
+				COMM.error(e.getLocalizedMessage());
+			}
+		}
+	}
+
+	/**
+	 * sends a message to all the remote servers / neighbours connected to this
+	 * server. This is a utility method for implementing distributed algorithms in
+	 * the servers' state machine: use this method when this server needs sending
+	 * messages to its neighbours. This method must be accessed into
+	 * {@code synchronized} blocks.
+	 * 
+	 * @param type
+	 *            message's type.
+	 * @param identity
+	 *            sender's identity, that is the identity of this server.
+	 * @param seqN
+	 *            message's sequence number.
+	 * @param msg
+	 *            message as a serializable object.
+	 * @throws IOException
+	 *             the communication exception thrown when sending the message.
+	 */
+	public void sendToAllServers(final int type, final int identity, final int seqN, final Serializable msg)
+			throws IOException {
+		// send to all the servers, thus first argument is null
+		forwardServers(null, type, identity, seqN, msg);
+	}
+
+	/**
+	 * sends a message to a particular remote server / neighbour. This is a utility
+	 * method for implementing distributed algorithms in the servers' state machine:
+	 * use this method when this server needs sending messages to a given neighbour.
+	 * This method must be accessed into {@code synchronized} blocks.
+	 * 
+	 * @param targetKey
+	 *            selection key of the neighbour.
+	 * @param type
+	 *            message's type.
+	 * @param identity
+	 *            sender's identity, that is the identity of this server.
+	 * @param seqN
+	 *            message's sequence number.
+	 * @param msg
+	 *            message as a serializable object.
+	 * @throws IOException
+	 *             the communication exception thrown when sending the message.
+	 */
+	public void sendToAServer(final SelectionKey targetKey, final int type, final int identity, final int seqN,
+			final Serializable msg) throws IOException {
+		Optional<FullDuplexMsgWorker> sendWorker = getServerWorker(targetKey);
+		if (!sendWorker.isPresent()) {
+			COMM.warn(Log.computeServerLogMessage(this, "tries to send a message, but null SelectionKey"));
+		} else {
+			sendWorker.get().sendMsg(type, identity, seqN, msg);
+		}
+		if (LOG_ON && COMM.isInfoEnabled()) {
+			COMM.info("Send message of type " + type + " to server of identity " + identity);
+		}
+	}
+
+	/**
+	 * sends a message to all the remote servers / neighbours connected to this
+	 * server, except one. This is a utility method for implementing distributed
+	 * algorithms in the servers' state machine: use this method when this server
+	 * needs sending messages to all its neighbours, except one. This method must be
+	 * accessed into {@code synchronized} blocks.
+	 * 
+	 * @param exceptKey
+	 *            the selection key of the server to exclude in the forwarding.
+	 * @param type
+	 *            message's type.
+	 * @param identity
+	 *            sender's identity, that is the identity of this server.
+	 * @param seqN
+	 *            message's sequence number.
+	 * @param s
+	 *            message as a serializable object.
+	 * @throws IOException
+	 *             the communication exception thrown when sending the message.
+	 */
+	public void sendToAllServersExceptOne(final SelectionKey exceptKey, final int type, final int identity,
+			final int seqN, final Serializable s) throws IOException {
+		forwardServers(exceptKey, type, identity, seqN, s);
+	}
+
+	/**
+	 * forwards a message to all the clients and the servers, except the entity
+	 * (client or server) from which the message has just been received. This method
+	 * must be accessed into {@code synchronized} blocks.
+	 * 
+	 * @param exceptKey
+	 *            selection key to exclude from the set of target connections, e.g.,
+	 *            selection key of the entity from which the message has been
+	 *            received.
+	 * @param type
+	 *            message's type.
+	 * @param identity
+	 *            sender's identity.
+	 * @param seqNumber
+	 *            message's sequence number.
+	 * @param msg
+	 *            message as a serializable object.
+	 * @throws IOException
+	 *             the communication exception thrown when sending the message.
+	 */
+	void forward(final SelectionKey exceptKey, final int type, final int identity, final int seqNumber,
+			final Serializable msg) throws IOException {
+		forwardServers(exceptKey, type, identity, seqNumber, msg);
+		forwardClients(exceptKey, type, identity, seqNumber, msg);
+	}
+
+	/**
+	 * forwards a message to all the servers, except the server from which the
+	 * message has just been received. This method must be accessed into
+	 * {@code synchronized} blocks.
+	 * 
+	 * @param exceptKey
+	 *            selection key to exclude from the set of target connections, e.g.,
+	 *            selection key of the entity from which the message has been
+	 *            received.
+	 * @param type
+	 *            message's type.
+	 * @param identity
+	 *            sender's identity.
+	 * @param seqNumber
+	 *            message's sequence number.
+	 * @param msg
+	 *            message as a serializable object.
+	 * @throws IOException
+	 *             the communication exception thrown when sending the message.
+	 */
+	private void forwardServers(final SelectionKey exceptKey, final int type, final int identity, final int seqNumber,
+			final Serializable msg) throws IOException {
+		int nbServers = 0;
+		for (Map.Entry<SelectionKey, FullDuplexMsgWorker> entry : allServerWorkers.entrySet()) {
+			if (entry.getKey() == exceptKey) {
+				if (LOG_ON && COMM.isDebugEnabled()) {
+					COMM.debug("do not send to a server " + "because (target == exceptKey)");
+				}
+				continue;
+			} else {
+				if (entry.getValue() == null) {
+					COMM.warn("Bad worker for server key " + entry.getKey());
+				} else {
+					entry.getValue().sendMsg(type, identity, seqNumber, msg);
+					nbServers++;
+				}
+			}
+		}
+		if (LOG_ON && COMM.isInfoEnabled()) {
+			COMM.info("Send message to " + nbServers + " server end points");
+		}
+	}
+
+	/**
+	 * forwards a message to all the clients, except the client from which the
+	 * message has just been received. This method must be accessed into
+	 * {@code synchronized} blocks.
+	 * 
+	 * @param exceptKey
+	 *            selection key to exclude from the set of target connections, e.g.,
+	 *            selection key of the entity from which the message has been
+	 *            received.
+	 * @param type
+	 *            message's type.
+	 * @param identity
+	 *            sender's identity.
+	 * @param seqNumber
+	 *            message's sequence number.
+	 * @param msg
+	 *            message as an serializable object.
+	 * @throws IOException
+	 *             the communication exception thrown when sending the message.
+	 */
+	private void forwardClients(final SelectionKey exceptKey, final int type, final int identity, final int seqNumber,
+			final Serializable msg) throws IOException {
+		int nbClients = 0;
+		for (Map.Entry<SelectionKey, FullDuplexMsgWorker> entry : allClientWorkers.entrySet()) {
+			if (entry.getKey() == exceptKey) {
+				if (LOG_ON && COMM.isDebugEnabled()) {
+					COMM.debug("do not send to a client " + "because (target == exceptKey)");
+				}
+				continue;
+			} else {
+				if (entry.getValue() == null) {
+					COMM.warn("Bad client for key " + entry);
+				} else {
+					entry.getValue().sendMsg(type, identity, seqNumber, msg);
+					nbClients++;
+				}
+			}
+		}
+		if (LOG_ON && COMM.isInfoEnabled()) {
+			COMM.info("Send message to " + nbClients + " client end points");
+		}
+	}
+
+	/**
+	 * treats a token message of the election algorithm.
+	 * 
+	 * NB1: do not forget to synchronise with {@code synchronized (this)}. <br>
+	 * NB2: at the end of the action, do not forget to set the attribute
+	 * {@link #selectionKeyOfCurrentMsg} to {@code null}.
+	 * 
+	 * @param content
+	 *            the content of the message to treat.
+	 * @throws IOException
+	 *            IOExeption.
+	 */
+	public void receiveTokenContent(final ElectionTokenContent content) throws IOException {
+		synchronized (this) {
+			if (caw == -1 || content.getInitiator() < caw) {
+				caw = content.getInitiator();
+				rec = 0;
+				parent = content.getSender();
+				this.setElectionParentKey(this.getSelectionKeyOfCurrentMsg().get());
+				ElectionTokenContent token = new ElectionTokenContent(this.getIdentity(), content.getInitiator());
+
+				this.sendToAllServersExceptOne(getElectionParentKey(), Action.TOKEN_MESSAGE.identifier(),
+						identity, -1, token);	
+
+
+			}
+			if (caw == content.getInitiator()) {
+				rec++;
+				if (rec == this.getAllServerWorkersSize()) {
+					ElectionLeaderContent leader = new ElectionLeaderContent(this.getIdentity(), this.getIdentity());
+					if (caw == identity) {
+
+						this.sendToAllServers(Action.LEADER_MESSAGE.identifier(), identity, -1, leader);	
+					} else {
+						ElectionTokenContent token = new ElectionTokenContent(this.getIdentity(), content.getInitiator());
+						this.sendToAServer(getElectionParentKey(), Action.TOKEN_MESSAGE.identifier(), identity, -1, token);
+					}
+
+				
+				} 
+			
+			}
+		}
+		setSelectionKeyOfCurrentMsg(null);
+	}
+
+		
+	
+
+	/**
+	 * treats a leader message of the election algorithm.
+	 * 
+	 * NB1: do not forget to synchronise with {@code synchronized (this)}. <br>
+	 * NB2: at the end of the action, do not forget to set the attribute
+	 * {@link #selectionKeyOfCurrentMsg} to {@code null}.
+	 * 
+	 * @param content
+	 *            the content of the message to treat.
+	 * @throws IOException
+	 *             IOException.
+	 */
+	public void receiveLeaderContent(final ElectionLeaderContent content) throws IOException {
+
+		synchronized (this) {
+			if (lrec == 0 && identity != content.getInitiator()) {
+				ElectionLeaderContent leader = new ElectionLeaderContent(this.getIdentity(), content.getInitiator());
+
+				this.sendToAllServers(Action.LEADER_MESSAGE.identifier(), identity, -1, leader);	
+
+			}
+			lrec++;
+			win = content.getInitiator();
+			if (lrec == this.getAllServerWorkersSize()) {
+				if (win == identity) {
+					this.state = State.leader;
+					this.critical = true;
+					if (LOG_ON && ELECTION.isInfoEnabled()) {
+						ELECTION.info("status = " + this.getState());
+					}
+					
+					if (LOG_ON && MUTEX.isInfoEnabled()) {
+						MUTEX.info("critical = " + this.getCritical());
+					}
+					jet = new RequestVector();
+				} else {
+
+					this.state = State.nonleader;
+					if (LOG_ON && ELECTION.isInfoEnabled()) {
+						ELECTION.info("status = " + this.getState());
+					}
+
+				}
+			}
+		}
+		setSelectionKeyOfCurrentMsg(null);
+	}
+	/**
+	 * treats a request message of the mutex algorithm.
+     *
+	 * @param content
+	 *            the content of the message to treat.
+	 * @throws IOException
+	 *             IOException.
+	 */
+	public void receiveRequestContent(final MutexRequestContent content) throws IOException {
+
+		if (this.vector.getEntry(content.getSender()) < content.getNs()) {
+			this.vector.setEntry(content.getSender(), content.getNs());
+		}
+		if (this.critical) {
+			jet.setEntry(this.identity, this.ns);
+			for (int i : this.vector.computeUnionOfKeys(/*this.vector.supMap(*/this.identity, /*this.vector.infMap(*/this.identity)) {
+				if (this.vector.getEntry(i) > jet.getEntry(i) && this.critical) {
+					MutexTokenContent token = new MutexTokenContent(this.getIdentity(), jet);
+					this.sendToAServer(this.sortedMapOfServerSelectionKeys.get(i), chat.server.algorithms.mutex.Action.TOKEN_MESSAGE.identifier(), this.identity, -1, token);
+					this.critical = false;
+					
+				}
+			}
+		}
+	}
+	/**
+	 * set map of server keys.
+	 * @param sortedMapOfServerSelectionKeys
+	 *           servers keys.
+	 */
+	public void setSortedMapOfServerSelectionKeys(final TreeMap<Integer, SelectionKey> sortedMapOfServerSelectionKeys) {
+		this.sortedMapOfServerSelectionKeys = sortedMapOfServerSelectionKeys;
+	}
+
+	/**
+	 * treats a request message of the mutex algorithm.
+     *
+	 * @param content
+	 *            the content of the message to treat.
+	 * @throws IOException
+	 *             IOException.
+	 */
+	public void receiveTokenMutexContent(final MutexTokenContent content) throws IOException {
+
+		this.critical = true;
+		jet = content.getJeton();
+	}
+	
+}
+
+			
+		
+	
+
